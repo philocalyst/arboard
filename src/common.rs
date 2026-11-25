@@ -147,22 +147,72 @@ impl ImageData<'_> {
 			bytes: self.bytes.clone().into_owned().into(),
 		}
 	}
+
+	/// Checks that the image has a non-zero size and that `bytes` holds exactly
+	/// `width * height * 4` bytes of RGBA data.
+	///
+	/// Every platform backend hands the pixel buffer to a native API (or an encoder) which trusts
+	/// the dimensions to describe the buffer, so this must be checked before any of them are
+	/// invoked. Otherwise a mismatched buffer can cause out-of-bounds reads (macOS), panics
+	/// (Linux, Windows), or a clipboard that was cleared without receiving new contents.
+	pub(crate) fn validate(&self) -> Result<(), Error> {
+		let expected_len = self
+			.width
+			.checked_mul(self.height)
+			.and_then(|pixels| pixels.checked_mul(4))
+			.ok_or(Error::ConversionFailure)?;
+
+		if expected_len == 0 || self.bytes.len() != expected_len {
+			return Err(Error::ConversionFailure);
+		}
+
+		Ok(())
+	}
 }
 
-#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+#[cfg(all(test, feature = "image-data"))]
+mod tests {
+	use super::ImageData;
+	use std::borrow::Cow;
+
+	fn image(width: usize, height: usize, len: usize) -> ImageData<'static> {
+		ImageData { width, height, bytes: Cow::Owned(vec![0; len]) }
+	}
+
+	#[test]
+	fn image_validation() {
+		assert!(image(1, 1, 4).validate().is_ok());
+		assert!(image(3, 2, 24).validate().is_ok());
+
+		// Empty images can't be represented on any clipboard.
+		assert!(image(0, 0, 0).validate().is_err());
+		assert!(image(0, 2, 0).validate().is_err());
+		assert!(image(2, 0, 0).validate().is_err());
+
+		// The buffer must match the dimensions exactly.
+		assert!(image(2, 2, 15).validate().is_err());
+		assert!(image(2, 2, 17).validate().is_err());
+		assert!(image(2, 2, 0).validate().is_err());
+
+		// Dimensions whose byte size overflows must be rejected rather than wrapping.
+		assert!(image(usize::MAX, 2, 8).validate().is_err());
+		assert!(image(usize::MAX / 4 + 1, 1, 4).validate().is_err());
+	}
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) struct ScopeGuard<F: FnOnce()> {
 	callback: Option<F>,
 }
 
-#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+#[cfg(all(unix, not(target_os = "macos")))]
 impl<F: FnOnce()> ScopeGuard<F> {
-	#[cfg_attr(all(windows, not(feature = "image-data")), allow(dead_code))]
 	pub(crate) fn new(callback: F) -> Self {
 		ScopeGuard { callback: Some(callback) }
 	}
 }
 
-#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+#[cfg(all(unix, not(target_os = "macos")))]
 impl<F: FnOnce()> Drop for ScopeGuard<F> {
 	fn drop(&mut self) {
 		if let Some(callback) = self.callback.take() {

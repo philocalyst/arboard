@@ -8,6 +8,7 @@ the Apache 2.0 or the MIT license at the licensee's choice. The terms
 and conditions of the chosen license apply to this file.
 */
 
+use super::cf_html;
 #[cfg(feature = "image-data")]
 use crate::common::ImageData;
 use crate::common::{private, Error};
@@ -34,7 +35,6 @@ use windows_sys::Win32::{
 #[cfg(feature = "image-data")]
 mod image_data {
 	use super::*;
-	use crate::common::ScopeGuard;
 	use image::codecs::bmp::BmpDecoder;
 	use image::codecs::png::PngDecoder;
 	use image::codecs::png::PngEncoder;
@@ -44,9 +44,7 @@ mod image_data {
 	use image::ImageEncoder;
 	use std::{convert::TryInto, mem::size_of, ptr::copy_nonoverlapping};
 	use windows_sys::Win32::{
-		Graphics::Gdi::{
-			DeleteObject, BITMAPV5HEADER, BI_BITFIELDS, BI_RGB, HGDIOBJ, LCS_GM_IMAGES,
-		},
+		Graphics::Gdi::{BITMAPV5HEADER, BI_BITFIELDS, BI_RGB, LCS_GM_IMAGES},
 		System::Ole::CF_DIBV5,
 	};
 
@@ -59,15 +57,20 @@ mod image_data {
 		#[allow(non_upper_case_globals)]
 		const LCS_sRGB: u32 = 0x7352_4742;
 
+		// The bitmap header stores the dimensions as `i32` and the image size as `u32`.
+		let width: i32 = image.width.try_into().map_err(|_| Error::ConversionFailure)?;
+		let height: i32 = image.height.try_into().map_err(|_| Error::ConversionFailure)?;
+		let size_image: u32 = image.bytes.len().try_into().map_err(|_| Error::ConversionFailure)?;
+
 		let header_size = size_of::<BITMAPV5HEADER>();
 		let header = BITMAPV5HEADER {
 			bV5Size: header_size as u32,
-			bV5Width: image.width as i32,
-			bV5Height: image.height as i32,
+			bV5Width: width,
+			bV5Height: height,
 			bV5Planes: 1,
 			bV5BitCount: 32,
 			bV5Compression: BI_BITFIELDS,
-			bV5SizeImage: (4 * image.width * image.height) as u32,
+			bV5SizeImage: size_image,
 			bV5XPelsPerMeter: 0,
 			bV5YPelsPerMeter: 0,
 			bV5ClrUsed: 0,
@@ -95,75 +98,70 @@ mod image_data {
 		let image = flip_v(image);
 
 		let data_size = header_size + image.bytes.len();
-		let hdata = unsafe { global_alloc(data_size)? };
-		unsafe {
-			let data_ptr = global_lock(hdata)?;
-			let _unlock = ScopeGuard::new(|| global_unlock_checked(hdata));
+		let mut hdata = OwnedGlobal::alloc(data_size)?;
+		{
+			let lock = hdata.lock()?;
+			let data_ptr = lock.as_ptr();
 
-			copy_nonoverlapping::<u8>(
-				(&header as *const BITMAPV5HEADER).cast(),
-				data_ptr,
-				header_size,
-			);
+			unsafe {
+				copy_nonoverlapping::<u8>(
+					(&header as *const BITMAPV5HEADER).cast(),
+					data_ptr,
+					header_size,
+				);
 
-			// Not using the `add` function, because that has a restriction, that the result cannot overflow isize
-			let pixels_dst = data_ptr.add(header_size);
-			copy_nonoverlapping::<u8>(image.bytes.as_ptr(), pixels_dst, image.bytes.len());
+				// Not using the `add` function, because that has a restriction, that the result cannot overflow isize
+				let pixels_dst = data_ptr.add(header_size);
+				copy_nonoverlapping::<u8>(image.bytes.as_ptr(), pixels_dst, image.bytes.len());
 
-			let dst_pixels_slice = std::slice::from_raw_parts_mut(pixels_dst, image.bytes.len());
+				let dst_pixels_slice =
+					std::slice::from_raw_parts_mut(pixels_dst, image.bytes.len());
 
-			// If the non-allocating version of the function failed, we need to assign the new bytes to
-			// the global allocation.
-			if let Cow::Owned(new_pixels) = rgba_to_win(dst_pixels_slice) {
-				// SAFETY: `data_ptr` is valid to write to and has no outstanding mutable borrows, and
-				// `new_pixels` will be the same length as the original bytes.
-				copy_nonoverlapping::<u8>(new_pixels.as_ptr(), data_ptr, new_pixels.len())
+				// If the non-allocating version of the function failed, we need to assign the new bytes to
+				// the global allocation.
+				if let Cow::Owned(new_pixels) = rgba_to_win(dst_pixels_slice) {
+					// SAFETY: `pixels_dst` is valid to write to and has no outstanding mutable borrows, and
+					// `new_pixels` will be the same length as the original bytes. The pixels must be
+					// written after the header, not over it.
+					copy_nonoverlapping::<u8>(new_pixels.as_ptr(), pixels_dst, new_pixels.len())
+				}
 			}
 		}
 
-		if unsafe { SetClipboardData(CF_DIBV5 as u32, hdata as HANDLE) }.failure() {
-			unsafe { DeleteObject(hdata as HGDIOBJ) };
-			Err(last_error("SetClipboardData failed with error"))
-		} else {
-			Ok(())
-		}
+		hdata.set_clipboard_data(CF_DIBV5 as u32)
 	}
 
-	pub(super) fn add_png_file(image: &ImageData) -> Result<(), Error> {
-		// Try encoding the image as PNG.
-		let mut buf = Vec::new();
-		let encoder = PngEncoder::new(&mut buf);
+	/// Encodes the image as a PNG file.
+	///
+	/// This is done before the clipboard gets emptied so that an encoding failure doesn't leave
+	/// the user with an empty clipboard.
+	pub(super) fn encode_png(image: &ImageData) -> Result<Vec<u8>, Error> {
+		let width: u32 = image.width.try_into().map_err(|_| Error::ConversionFailure)?;
+		let height: u32 = image.height.try_into().map_err(|_| Error::ConversionFailure)?;
 
-		encoder
-			.write_image(
-				&image.bytes,
-				image.width as u32,
-				image.height as u32,
-				ExtendedColorType::Rgba8,
-			)
+		let mut buf = Vec::new();
+		PngEncoder::new(&mut buf)
+			.write_image(&image.bytes, width, height, ExtendedColorType::Rgba8)
 			.map_err(|_| Error::ConversionFailure)?;
 
+		Ok(buf)
+	}
+
+	pub(super) fn add_png_file(png: &[u8]) -> Result<(), Error> {
 		// Register PNG format.
 		let format_id = match clipboard_win::register_format("PNG") {
 			Some(format_id) => format_id.into(),
 			None => return Err(last_error("Cannot register PNG clipboard format.")),
 		};
 
-		let data_size = buf.len();
-		let hdata = unsafe { global_alloc(data_size)? };
-
-		unsafe {
-			let pixels_dst = global_lock(hdata)?;
-			copy_nonoverlapping::<u8>(buf.as_ptr(), pixels_dst, data_size);
-			global_unlock_checked(hdata);
+		let mut hdata = OwnedGlobal::alloc(png.len())?;
+		{
+			let lock = hdata.lock()?;
+			// SAFETY: The allocation is exactly `png.len()` bytes long.
+			unsafe { copy_nonoverlapping::<u8>(png.as_ptr(), lock.as_ptr(), png.len()) };
 		}
 
-		if unsafe { SetClipboardData(format_id, hdata as HANDLE) }.failure() {
-			unsafe { DeleteObject(hdata as HGDIOBJ) };
-			Err(last_error("SetClipboardData failed with error"))
-		} else {
-			Ok(())
-		}
+		hdata.set_clipboard_data(format_id)
 	}
 
 	// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapv5header
@@ -445,32 +443,82 @@ mod image_data {
 	}
 }
 
-unsafe fn global_alloc(bytes: usize) -> Result<HGLOBAL, Error> {
-	let hdata = GlobalAlloc(GHND, bytes);
-	if hdata.is_null() {
-		Err(last_error("Could not allocate global memory object"))
-	} else {
-		Ok(hdata)
+/// An owned, movable global memory object which is freed on drop unless ownership is
+/// transferred to the system clipboard with [`OwnedGlobal::set_clipboard_data`].
+struct OwnedGlobal(HGLOBAL);
+
+impl OwnedGlobal {
+	/// Allocates a zero-initialized, movable global memory object of `bytes` size.
+	fn alloc(bytes: usize) -> Result<Self, Error> {
+		// SAFETY: `GlobalAlloc` has no preconditions.
+		let hdata = unsafe { GlobalAlloc(GHND, bytes) };
+		if hdata.failure() {
+			Err(last_error("Could not allocate global memory object"))
+		} else {
+			Ok(Self(hdata))
+		}
+	}
+
+	/// Locks the memory object and returns a guard holding a pointer to its first byte. The
+	/// object is unlocked again when the guard is dropped, even if the caller returns early.
+	fn lock(&mut self) -> Result<GlobalLockGuard<'_>, Error> {
+		// SAFETY: `self.0` is a valid global memory handle owned by us.
+		let data_ptr = unsafe { GlobalLock(self.0) }.cast::<u8>();
+		if data_ptr.is_null() {
+			Err(last_error("Could not lock the global memory object"))
+		} else {
+			Ok(GlobalLockGuard { hdata: self.0, data_ptr, _owner: PhantomData })
+		}
+	}
+
+	/// Places the memory object onto the (open) clipboard under `format`.
+	///
+	/// On success the system takes ownership of the memory. On failure it is freed by us, as
+	/// required by the `SetClipboardData` contract.
+	fn set_clipboard_data(self, format: u32) -> Result<(), Error> {
+		// SAFETY: The clipboard is open (all callers hold an `OpenClipboard`) and `self.0` is an
+		// unlocked, movable global memory object.
+		if unsafe { SetClipboardData(format, self.0 as HANDLE) }.failure() {
+			// `self` is dropped here, freeing the memory, which still belongs to us.
+			Err(last_error("SetClipboardData failed with error"))
+		} else {
+			// The system owns the memory now and we must not free it.
+			std::mem::forget(self);
+			Ok(())
+		}
 	}
 }
 
-unsafe fn global_lock(hmem: HGLOBAL) -> Result<*mut u8, Error> {
-	let data_ptr = GlobalLock(hmem).cast::<u8>();
-	if data_ptr.is_null() {
-		Err(last_error("Could not lock the global memory object"))
-	} else {
-		Ok(data_ptr)
+impl Drop for OwnedGlobal {
+	fn drop(&mut self) {
+		// SAFETY: We own the handle and nothing else references it anymore.
+		unsafe { GlobalFree(self.0) };
 	}
 }
 
-unsafe fn global_unlock_checked(hdata: HGLOBAL) {
-	// If the memory object is unlocked after decrementing the lock count, the function
-	// returns zero and GetLastError returns NO_ERROR. If it fails, the return value is
-	// zero and GetLastError returns a value other than NO_ERROR.
-	if GlobalUnlock(hdata) == 0 {
-		let err = io::Error::last_os_error();
-		if err.raw_os_error() != Some(0) {
-			log::error!("Failed calling GlobalUnlock when writing data: {}", err);
+/// A lock on an [`OwnedGlobal`], released when dropped.
+struct GlobalLockGuard<'a> {
+	hdata: HGLOBAL,
+	data_ptr: *mut u8,
+	_owner: PhantomData<&'a mut OwnedGlobal>,
+}
+
+impl GlobalLockGuard<'_> {
+	fn as_ptr(&self) -> *mut u8 {
+		self.data_ptr
+	}
+}
+
+impl Drop for GlobalLockGuard<'_> {
+	fn drop(&mut self) {
+		// If the memory object is unlocked after decrementing the lock count, the function
+		// returns zero and GetLastError returns NO_ERROR. If it fails, the return value is
+		// zero and GetLastError returns a value other than NO_ERROR.
+		if unsafe { GlobalUnlock(self.hdata) } == 0 {
+			let err = io::Error::last_os_error();
+			if err.raw_os_error() != Some(0) {
+				log::error!("Failed calling GlobalUnlock when writing data: {}", err);
+			}
 		}
 	}
 }
@@ -614,11 +662,18 @@ impl<'clipboard> Get<'clipboard> {
 		let format = clipboard_win::register_format("HTML Format")
 			.ok_or_else(|| Error::unknown("unable to register HTML format"))?;
 
-		let mut out: Vec<u8> = Vec::new();
-		clipboard_win::raw::get_html(format.get(), &mut out)
-			.map_err(|_| Error::unknown("failed to read clipboard string"))?;
+		if !clipboard_win::is_format_avail(format.get()) {
+			return Err(Error::ContentNotAvailable);
+		}
 
-		String::from_utf8(out).map_err(|_| Error::ConversionFailure)
+		// The raw `CF_HTML` bytes are read and the fragment is extracted by us, with every offset
+		// from the (untrusted) header checked against the actual size of the data.
+		let mut data: Vec<u8> = Vec::new();
+		clipboard_win::raw::get_vec(format.get(), &mut data)
+			.map_err(|_| Error::unknown("failed to read clipboard HTML data"))?;
+
+		let fragment = cf_html::extract_fragment(&data).ok_or(Error::ConversionFailure)?;
+		String::from_utf8(fragment.to_vec()).map_err(|_| Error::ConversionFailure)
 	}
 
 	#[cfg(feature = "image-data")]
@@ -696,7 +751,7 @@ impl<'clipboard> Set<'clipboard> {
 			.map_err(|_| Error::unknown("Could not place the specified text to the clipboard"))?;
 
 		if let Some(format) = clipboard_win::register_format("HTML Format") {
-			let html = wrap_html(&html);
+			let html = cf_html::wrap(&html);
 			clipboard_win::raw::set_without_clear(format.get(), html.as_bytes())
 				.map_err(|e| Error::unknown(e.to_string()))?;
 		}
@@ -713,6 +768,11 @@ impl<'clipboard> Set<'clipboard> {
 	pub(crate) fn image(self, image: ImageData) -> Result<(), Error> {
 		let open_clipboard = self.clipboard?;
 
+		// Validate and encode the image before emptying the clipboard, so that invalid image data
+		// doesn't leave the user with an empty clipboard.
+		image.validate()?;
+		let png = image_data::encode_png(&image)?;
+
 		if let Err(e) = clipboard_win::raw::empty() {
 			return Err(Error::unknown(format!(
 				"Failed to empty the clipboard. Got error code: {e}"
@@ -721,7 +781,7 @@ impl<'clipboard> Set<'clipboard> {
 
 		// XXX: The ordering of these functions is important, as some programs will grab the
 		// first format available. PNGs tend to have better compatibility on Windows, so it is set first.
-		image_data::add_png_file(&image)?;
+		image_data::add_png_file(&png)?;
 		image_data::add_cf_dibv5(open_clipboard, image)?;
 		Ok(())
 	}
@@ -762,29 +822,29 @@ impl<'clipboard> Set<'clipboard> {
 		// Add space for the final null character
 		data_len += std::mem::size_of::<u16>();
 
-		unsafe {
-			let h_global = global_alloc(data_len)?;
-			let data_ptr = global_lock(h_global)?;
+		let mut h_global = OwnedGlobal::alloc(data_len)?;
+		{
+			let lock = h_global.lock()?;
+			let data_ptr = lock.as_ptr();
 
-			(data_ptr as *mut DROPFILES).write(dropfiles);
+			// SAFETY: The allocation is `data_len` bytes long, which was computed above to hold the
+			// header, every NULL-terminated path and the final NULL character.
+			unsafe {
+				(data_ptr as *mut DROPFILES).write_unaligned(dropfiles);
 
-			let mut ptr = data_ptr.add(DROPFILES_HEADER_SIZE) as *mut u16;
+				let mut ptr = data_ptr.add(DROPFILES_HEADER_SIZE) as *mut u16;
 
-			for wide_path in paths {
-				std::ptr::copy_nonoverlapping::<u16>(wide_path.as_ptr(), ptr, wide_path.len());
-				ptr = ptr.add(wide_path.len());
-			}
+				for wide_path in paths {
+					std::ptr::copy_nonoverlapping::<u16>(wide_path.as_ptr(), ptr, wide_path.len());
+					ptr = ptr.add(wide_path.len());
+				}
 
-			// Write final null character
-			ptr.write(0);
-
-			global_unlock_checked(h_global);
-
-			if SetClipboardData(CF_HDROP.into(), h_global as HANDLE).failure() {
-				GlobalFree(h_global);
-				return Err(last_error("SetClipboardData failed with error"));
+				// Write final null character
+				ptr.write_unaligned(0);
 			}
 		}
+
+		h_global.set_clipboard_data(CF_HDROP.into())?;
 
 		add_clipboard_exclusions(
 			clipboard_assertion,
@@ -893,29 +953,6 @@ impl<'clipboard> Clear<'clipboard> {
 		let _clipboard_assertion = self.clipboard?;
 		clipboard_win::empty().map_err(|_| Error::unknown("failed to clear clipboard"))
 	}
-}
-
-fn wrap_html(ctn: &str) -> String {
-	let h_version = "Version:0.9";
-	let h_start_html = "\r\nStartHTML:";
-	let h_end_html = "\r\nEndHTML:";
-	let h_start_frag = "\r\nStartFragment:";
-	let h_end_frag = "\r\nEndFragment:";
-	let c_start_frag = "\r\n<html>\r\n<body>\r\n<!--StartFragment-->\r\n";
-	let c_end_frag = "\r\n<!--EndFragment-->\r\n</body>\r\n</html>";
-	let h_len = h_version.len()
-		+ h_start_html.len()
-		+ 10 + h_end_html.len()
-		+ 10 + h_start_frag.len()
-		+ 10 + h_end_frag.len()
-		+ 10;
-	let n_start_html = h_len + 2;
-	let n_start_frag = h_len + c_start_frag.len();
-	let n_end_frag = n_start_frag + ctn.len();
-	let n_end_html = n_end_frag + c_end_frag.len();
-	format!(
-		"{h_version}{h_start_html}{n_start_html:010}{h_end_html}{n_end_html:010}{h_start_frag}{n_start_frag:010}{h_end_frag}{n_end_frag:010}{c_start_frag}{ctn}{c_end_frag}"
-	)
 }
 
 /// Given a file path attempt to open it and call GetFinalPathNameByHandleW,
