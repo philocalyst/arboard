@@ -6,6 +6,9 @@ mod linux;
 ))]
 pub use linux::*;
 
+#[cfg(any(windows, test))]
+mod cf_html;
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

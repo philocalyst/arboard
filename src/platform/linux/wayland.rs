@@ -1,5 +1,6 @@
 use std::{
 	borrow::Cow,
+	collections::HashSet,
 	io::Read,
 	path::{Path, PathBuf},
 };
@@ -13,8 +14,8 @@ use wl_clipboard_rs::{
 #[cfg(feature = "image-data")]
 use super::encode_as_png;
 use super::{
-	gnome_copied_files_from_uri_list, into_unknown, paths_from_uri_list, paths_to_uri_list,
-	LinuxClipboardKind, WaitConfig, GNOME_COPIED_FILES_MIME, KDE_EXCLUSION_HINT,
+	gnome_copied_files_from_uri_list, into_unknown, latin1_to_utf8, paths_from_uri_list,
+	paths_to_uri_list, LinuxClipboardKind, WaitConfig, GNOME_COPIED_FILES_MIME, KDE_EXCLUSION_HINT,
 	KDE_EXCLUSION_MIME, URI_LIST_MIME,
 };
 use crate::common::Error;
@@ -23,6 +24,26 @@ use crate::common::ImageData;
 
 #[cfg(feature = "image-data")]
 const MIME_PNG: &str = "image/png";
+
+/// The MIME types which plain text is read from, in order of preference, and whether the data is
+/// encoded as ISO Latin-1 (instead of UTF-8).
+///
+/// This is deliberately not `paste::MimeType::Text`, which falls back to *any* textual MIME type
+/// (`text/html`, `text/uri-list`, JSON, ...) and would therefore return HTML markup or file URIs as
+/// plain text.
+const TEXT_MIME_TYPES: &[(&str, bool)] = &[
+	("text/plain;charset=utf-8", false),
+	("text/plain;charset=UTF-8", false),
+	("UTF8_STRING", false),
+	// X11-style Latin-1 text, which is commonly offered by Xwayland clients.
+	("STRING", true),
+	("TEXT", false),
+	("text/plain", false),
+];
+
+fn select_text_mime_type(offered: &HashSet<String>) -> Option<(&'static str, bool)> {
+	TEXT_MIME_TYPES.iter().copied().find(|(mime_type, _)| offered.contains(*mime_type))
+}
 
 pub(crate) struct Clipboard {}
 
@@ -119,8 +140,23 @@ impl Clipboard {
 	}
 
 	pub(crate) fn get_text(&mut self, selection: LinuxClipboardKind) -> Result<String, Error> {
-		handle_clipboard_read(selection, paste::MimeType::Text, |contents| {
-			String::from_utf8(contents).map_err(|_| Error::ConversionFailure)
+		let offered = match paste::get_mime_types(selection.try_into()?, Seat::Unspecified) {
+			Ok(offered) => offered,
+			Err(PasteError::ClipboardEmpty) | Err(PasteError::NoMimeType) => {
+				return Err(Error::ContentNotAvailable)
+			}
+			Err(err) => return Err(handle_paste_error(err)),
+		};
+
+		let (mime_type, is_latin1) =
+			select_text_mime_type(&offered).ok_or(Error::ContentNotAvailable)?;
+
+		handle_clipboard_read(selection, paste::MimeType::Specific(mime_type), |contents| {
+			if is_latin1 {
+				Ok(latin1_to_utf8(&contents))
+			} else {
+				String::from_utf8(contents).map_err(|_| Error::ConversionFailure)
+			}
 		})
 	}
 
@@ -274,5 +310,42 @@ impl Clipboard {
 		add_clipboard_exclusions(exclude_from_history, &mut sources);
 
 		opts.copy_multi(sources).map_err(handle_copy_error)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn offered(mime_types: &[&str]) -> HashSet<String> {
+		mime_types.iter().map(|m| m.to_string()).collect()
+	}
+
+	#[test]
+	fn text_mime_type_selection() {
+		// Only non-plain textual formats must not be read as text.
+		assert_eq!(select_text_mime_type(&offered(&["text/html"])), None);
+		assert_eq!(
+			select_text_mime_type(&offered(&[URI_LIST_MIME, GNOME_COPIED_FILES_MIME])),
+			None
+		);
+		assert_eq!(select_text_mime_type(&offered(&["application/json"])), None);
+
+		// UTF-8 is preferred over the other encodings.
+		assert_eq!(
+			select_text_mime_type(&offered(&["text/plain", "STRING", "text/plain;charset=utf-8"])),
+			Some(("text/plain;charset=utf-8", false))
+		);
+		assert_eq!(
+			select_text_mime_type(&offered(&["text/html", "UTF8_STRING"])),
+			Some(("UTF8_STRING", false))
+		);
+
+		// Latin-1 is only used if nothing better is available.
+		assert_eq!(
+			select_text_mime_type(&offered(&["STRING", "text/plain"])),
+			Some(("STRING", true))
+		);
+		assert_eq!(select_text_mime_type(&offered(&["text/plain"])), Some(("text/plain", false)));
 	}
 }
