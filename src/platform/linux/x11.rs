@@ -46,9 +46,9 @@ use x11rb::{
 #[cfg(feature = "image-data")]
 use super::encode_as_png;
 use super::{
-	gnome_copied_files_from_uri_list, into_unknown, paths_from_uri_list, paths_to_uri_list,
-	LinuxClipboardKind, WaitConfig, GNOME_COPIED_FILES_MIME, KDE_EXCLUSION_HINT,
-	KDE_EXCLUSION_MIME, URI_LIST_MIME,
+	gnome_copied_files_from_uri_list, into_unknown, latin1_to_utf8, paths_from_uri_list,
+	paths_to_uri_list, utf8_to_latin1, LinuxClipboardKind, WaitConfig, GNOME_COPIED_FILES_MIME,
+	KDE_EXCLUSION_HINT, KDE_EXCLUSION_MIME, URI_LIST_MIME,
 };
 #[cfg(feature = "image-data")]
 use crate::ImageData;
@@ -101,7 +101,10 @@ thread_local! {
 // Some clipboard items, like images, may take a very long time to produce a
 // `SelectionNotify`. Multiple seconds long.
 const LONG_TIMEOUT_DUR: Duration = Duration::from_millis(4000);
-const SHORT_TIMEOUT_DUR: Duration = Duration::from_millis(10);
+// The maximum time to wait for the next segment of an `INCR` transfer. Selection owners
+// produce the segments as we consume them, so this needs to tolerate a busy owner and a loaded
+// system rather than just the round trip time to the X server.
+const INCR_SEGMENT_TIMEOUT_DUR: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, PartialEq, Eq)]
 enum ManagerHandoverState {
@@ -202,7 +205,7 @@ struct ClipboardData {
 }
 
 enum ReadSelNotifyResult {
-	GotData(Vec<u8>),
+	GotData(ClipboardData),
 	IncrStarted,
 	EventNotRecognized,
 }
@@ -327,8 +330,8 @@ impl Inner {
 		trace!("Trying to get the clipboard data.");
 		for format in formats {
 			match self.read_single(&reader, selection, *format) {
-				Ok(bytes) => {
-					return Ok(ClipboardData { bytes, format: *format });
+				Ok(data) => {
+					return Ok(data);
 				}
 				Err(Error::ContentNotAvailable) => {
 					continue;
@@ -344,7 +347,7 @@ impl Inner {
 		reader: &XContext,
 		selection: LinuxClipboardKind,
 		target_format: Atom,
-	) -> Result<Vec<u8>> {
+	) -> Result<ClipboardData> {
 		// Delete the property so that we can detect (using property notify)
 		// when the selection owner receives our request.
 		reader
@@ -367,7 +370,7 @@ impl Inner {
 
 		trace!("Finished `convert_selection`");
 
-		let mut incr_data: Vec<u8> = Vec::new();
+		let mut incr_data = ClipboardData { bytes: Vec::new(), format: AtomEnum::NONE.into() };
 		let mut using_incr = false;
 
 		let mut timeout_end = Instant::now() + LONG_TIMEOUT_DUR;
@@ -397,8 +400,8 @@ impl Inner {
 						ReadSelNotifyResult::IncrStarted => {
 							// This means we received an indication that an the
 							// data is going to be sent INCRementally. Let's
-							// reset our timeout.
-							timeout_end += SHORT_TIMEOUT_DUR;
+							// reset our timeout to wait for the first segment.
+							timeout_end = Instant::now() + INCR_SEGMENT_TIMEOUT_DUR;
 						}
 						ReadSelNotifyResult::EventNotRecognized => (),
 					}
@@ -498,7 +501,7 @@ impl Inner {
 		reader: &XContext,
 		target_format: u32,
 		using_incr: &mut bool,
-		incr_data: &mut Vec<u8>,
+		incr_data: &mut ClipboardData,
 		event: SelectionNotifyEvent,
 	) -> Result<ReadSelNotifyResult> {
 		// The property being set to NONE means that the `convert_selection`
@@ -517,47 +520,38 @@ impl Inner {
 			log::warn!("Received a SelectionNotify while already expecting INCR segments.");
 			return Ok(ReadSelNotifyResult::EventNotRecognized);
 		}
-		// request the selection
-		let mut reply = reader
+		// Request the selection with `AnyPropertyType`. The type of the reply doesn't have to
+		// match the requested target: for example `TEXT` is answered with the actual encoding,
+		// such as `STRING` or `UTF8_STRING`, and large transfers use `INCR`. Requesting a
+		// specific type would make the server return no data and keep the property around in
+		// these cases.
+		//
+		// See: https://tronche.com/gui/x/icccm/sec-2.html#s-2.6.2
+		let reply = reader
 			.conn
-			.get_property(true, event.requestor, event.property, event.target, 0, u32::MAX / 4)
+			.get_property(true, event.requestor, event.property, AtomEnum::ANY, 0, u32::MAX / 4)
 			.map_err(into_unknown)?
 			.reply()
 			.map_err(into_unknown)?;
 
-		// trace!("Property.type: {:?}", self.atom_name(reply.type_));
-
-		// we found something
-		if reply.type_ == target_format {
-			Ok(ReadSelNotifyResult::GotData(reply.value))
-		} else if reply.type_ == self.atoms.INCR {
-			// Note that we call the get_property again because we are
-			// indicating that we are ready to receive the data by deleting the
-			// property, however deleting only works if the type matches the
-			// property type. But the type didn't match in the previous call.
-			reply = reader
-				.conn
-				.get_property(
-					true,
-					event.requestor,
-					event.property,
-					self.atoms.INCR,
-					0,
-					u32::MAX / 4,
-				)
-				.map_err(into_unknown)?
-				.reply()
-				.map_err(into_unknown)?;
+		if reply.type_ == self.atoms.INCR {
+			// Deleting the property (which `get_property` just did) indicates to the owner that
+			// we are ready to receive the data segments.
 			log::trace!("Receiving INCR segments");
 			*using_incr = true;
 			if reply.value_len == 4 {
 				let min_data_len = reply.value32().and_then(|mut vals| vals.next()).unwrap_or(0);
-				incr_data.reserve(min_data_len as usize);
+				incr_data.bytes.reserve(min_data_len as usize);
 			}
 			Ok(ReadSelNotifyResult::IncrStarted)
+		} else if reply.type_ == u32::from(AtomEnum::NONE) {
+			// The owner didn't actually store anything in the property.
+			Err(Error::ContentNotAvailable)
 		} else {
-			// this should never happen, we have sent a request only for supported types
-			Err(Error::unknown("incorrect type received from clipboard"))
+			Ok(ReadSelNotifyResult::GotData(ClipboardData {
+				bytes: reply.value,
+				format: reply.type_,
+			}))
 		}
 	}
 
@@ -567,7 +561,7 @@ impl Inner {
 		reader: &XContext,
 		target_format: u32,
 		using_incr: bool,
-		incr_data: &mut Vec<u8>,
+		incr_data: &mut ClipboardData,
 		timeout_end: &mut Instant,
 		event: PropertyNotifyEvent,
 	) -> Result<bool> {
@@ -579,9 +573,13 @@ impl Inner {
 			// now preparing the data
 			return Ok(false);
 		}
+		// As for the initial reply, the segments are requested with `AnyPropertyType`. Requesting
+		// `target_format` would make the server return no data (which looks exactly like the
+		// final, empty segment) whenever the owner uses a different type, silently truncating
+		// the transfer.
 		let reply = reader
 			.conn
-			.get_property(true, event.window, event.atom, target_format, 0, u32::MAX / 4)
+			.get_property(true, event.window, event.atom, AtomEnum::ANY, 0, u32::MAX / 4)
 			.map_err(into_unknown)?
 			.reply()
 			.map_err(into_unknown)?;
@@ -589,18 +587,64 @@ impl Inner {
 		// log::trace!("Received segment. value_len {}", reply.value_len,);
 		if reply.value_len == 0 {
 			// This indicates that all the data has been sent.
+			if incr_data.format == u32::from(AtomEnum::NONE) {
+				incr_data.format = target_format;
+			}
 			return Ok(true);
 		}
-		incr_data.extend(reply.value);
+		if incr_data.format == u32::from(AtomEnum::NONE) {
+			incr_data.format = reply.type_;
+		}
+		incr_data.bytes.extend(reply.value);
 
 		// Let's reset our timeout, since we received a valid chunk.
-		*timeout_end = Instant::now() + SHORT_TIMEOUT_DUR;
+		*timeout_end = Instant::now() + INCR_SEGMENT_TIMEOUT_DUR;
 
 		// Not yet complete
 		Ok(false)
 	}
 
-	fn handle_selection_request(&self, event: SelectionRequestEvent) -> Result<()> {
+	/// Returns whether `target` is a text target which is served from `UTF8_STRING` data.
+	fn is_text_alias(&self, target: Atom) -> bool {
+		[
+			self.atoms.UTF8_MIME_0,
+			self.atoms.UTF8_MIME_1,
+			self.atoms.TEXT,
+			self.atoms.TEXT_MIME_UNKNOWN,
+			self.atoms.STRING,
+		]
+		.contains(&target)
+	}
+
+	/// Converts the stored data into the requested `target`, returning the property type and
+	/// contents to reply with, or `None` if the target can't be provided.
+	fn convert_for_target<'a>(
+		&self,
+		data_list: &'a [ClipboardData],
+		target: Atom,
+	) -> Option<(Atom, Cow<'a, [u8]>)> {
+		if let Some(data) = data_list.iter().find(|d| d.format == target) {
+			return Some((target, Cow::Borrowed(&data.bytes)));
+		}
+
+		// Text is stored once as `UTF8_STRING`, but is offered under all common text targets so
+		// that older clients, and those which only ask for MIME types, can paste it too.
+		if !self.is_text_alias(target) {
+			return None;
+		}
+		let text = data_list.iter().find(|d| d.format == self.atoms.UTF8_STRING)?;
+
+		if target == self.atoms.STRING {
+			utf8_to_latin1(&text.bytes).map(|latin1| (target, Cow::Owned(latin1)))
+		} else if target == self.atoms.TEXT {
+			// `TEXT` is answered with the actual encoding of the data.
+			Some((self.atoms.UTF8_STRING, Cow::Borrowed(&text.bytes)))
+		} else {
+			Some((target, Cow::Borrowed(&text.bytes)))
+		}
+	}
+
+	fn handle_selection_request(&self, mut event: SelectionRequestEvent) -> Result<()> {
 		let selection = match self.kind_of(event.selection) {
 			Some(kind) => kind,
 			None => {
@@ -608,6 +652,15 @@ impl Inner {
 				return Ok(());
 			}
 		};
+
+		// "If the specified property is None, the requestor is an obsolete client. Owners are
+		// encouraged to support these clients by using the specified target atom as the property
+		// name to be used for the reply."
+		//
+		// See: https://tronche.com/gui/x/icccm/sec-2.html#s-2.2
+		if event.property == u32::from(AtomEnum::NONE) {
+			event.property = event.target;
+		}
 
 		let success;
 		// we are asked for a list of supported conversion targets
@@ -627,6 +680,12 @@ impl Inner {
 						// add all equivalent formats to the supported targets
 						targets.push(self.atoms.UTF8_MIME_0);
 						targets.push(self.atoms.UTF8_MIME_1);
+						targets.push(self.atoms.TEXT);
+						targets.push(self.atoms.TEXT_MIME_UNKNOWN);
+						// Only advertise `STRING` if the text can actually be converted to it.
+						if utf8_to_latin1(&data.bytes).is_some() {
+							targets.push(self.atoms.STRING);
+						}
 					}
 
 					if data.format == self.atoms.X_KDE_PASSWORDMANAGERHINT {
@@ -671,16 +730,16 @@ impl Inner {
 			trace!("Handling request for (probably) the clipboard contents.");
 			let data = self.selection_of(selection).data.read();
 			if let Some(data_list) = &*data {
-				success = match data_list.iter().find(|d| d.format == event.target) {
-					Some(data) => {
+				success = match self.convert_for_target(data_list, event.target) {
+					Some((type_, bytes)) => {
 						self.server
 							.conn
 							.change_property8(
 								PropMode::REPLACE,
 								event.requestor,
 								event.property,
-								event.target,
-								&data.bytes,
+								type_,
+								&bytes,
 							)
 							.map_err(into_unknown)?;
 						self.server.conn.flush().map_err(into_unknown)?;
@@ -965,8 +1024,20 @@ pub(crate) struct Clipboard {
 impl Clipboard {
 	pub(crate) fn new() -> Result<Self> {
 		let mut global_cb = CLIPBOARD.lock();
-		if let Some(global_cb) = &*global_cb {
-			return Ok(Self { inner: Arc::clone(&global_cb.inner) });
+		if let Some(existing) = &*global_cb {
+			if !existing.inner.serve_stopped.load(Ordering::Relaxed) {
+				return Ok(Self { inner: Arc::clone(&existing.inner) });
+			}
+
+			// The thread serving the selection requests has exited, for example because the
+			// connection to the X server broke. A clipboard sharing that context could never
+			// write again, so discard it and start over with a fresh connection.
+			warn!("The clipboard handler thread had stopped, reconnecting to the X server.");
+			if let Some(GlobalClipboard { inner, server_handle }) = global_cb.take() {
+				drop(inner);
+				// The thread has already finished (or is just about to), so this doesn't block.
+				let _ = server_handle.join();
+			}
 		}
 		// At this point we know that the clipboard does not exist.
 		let ctx = Arc::new(Inner::new()?);
@@ -1006,10 +1077,11 @@ impl Clipboard {
 			self.inner.atoms.TEXT_MIME_UNKNOWN,
 		];
 		let result = self.inner.read(&formats, selection)?;
+		// Note that `format` is the type of the received data, which can differ from the
+		// requested target (for example, `TEXT` is typically answered with `STRING`).
 		if result.format == self.inner.atoms.STRING {
 			// ISO Latin-1
-			// See: https://stackoverflow.com/questions/28169745/what-are-the-options-to-convert-iso-8859-1-latin-1-to-a-string-utf-8
-			Ok(result.bytes.into_iter().map(|c| c as char).collect())
+			Ok(latin1_to_utf8(&result.bytes))
 		} else {
 			String::from_utf8(result.bytes).map_err(|_| Error::ConversionFailure)
 		}
@@ -1145,7 +1217,13 @@ impl Drop for Clipboard {
 		// We start with locking the global guard to prevent race
 		// conditions below.
 		let mut global_cb = CLIPBOARD.lock();
-		if Arc::strong_count(&self.inner) == MIN_OWNERS {
+
+		// If the global clipboard was replaced (see `Clipboard::new`), this instance belongs to
+		// a context which was already discarded and must not tear down the current one.
+		let is_current =
+			matches!(&*global_cb, Some(global) if Arc::ptr_eq(&global.inner, &self.inner));
+
+		if is_current && Arc::strong_count(&self.inner) == MIN_OWNERS {
 			// If the are the only owners of the clipboard are ourselves and
 			// the global object, then we should destroy the global object,
 			// and send the data to the clipboard manager

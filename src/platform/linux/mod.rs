@@ -33,19 +33,15 @@ fn into_unknown<E: std::fmt::Display>(error: E) -> Error {
 fn encode_as_png(image: &ImageData) -> Result<Vec<u8>, Error> {
 	use image::ImageEncoder as _;
 
-	if image.bytes.is_empty() || image.width == 0 || image.height == 0 {
-		return Err(Error::ConversionFailure);
-	}
+	// The encoder panics if the buffer doesn't match the dimensions.
+	image.validate()?;
+	let width: u32 = image.width.try_into().map_err(|_| Error::ConversionFailure)?;
+	let height: u32 = image.height.try_into().map_err(|_| Error::ConversionFailure)?;
 
 	let mut png_bytes = Vec::new();
 	let encoder = image::codecs::png::PngEncoder::new(&mut png_bytes);
 	encoder
-		.write_image(
-			image.bytes.as_ref(),
-			image.width as u32,
-			image.height as u32,
-			image::ExtendedColorType::Rgba8,
-		)
+		.write_image(image.bytes.as_ref(), width, height, image::ExtendedColorType::Rgba8)
 		.map_err(|_| Error::ConversionFailure)?;
 
 	Ok(png_bytes)
@@ -55,10 +51,30 @@ fn paths_from_uri_list(uri_list: Vec<u8>) -> Vec<PathBuf> {
 	uri_list
 		.split(|char| *char == b'\n')
 		.map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-		.filter_map(|line| line.strip_prefix(b"file://"))
-		.filter_map(|s| percent_decode(s).decode_utf8().ok())
-		.map(|decoded| PathBuf::from(decoded.as_ref()))
+		.filter_map(path_from_file_uri)
 		.collect()
+}
+
+/// Converts a `file://` URI into a local path.
+///
+/// Both the empty authority (`file:///path`) and `localhost` (`file://localhost/path`) refer to the
+/// local machine, as defined by RFC 8089. URIs naming any other host, as well as non-`file` URIs,
+/// can't be represented as a local path and are skipped. Lines starting with `#` are comments
+/// according to RFC 2483 and are skipped by the same check.
+///
+/// Paths on Unix are arbitrary bytes, so they are decoded without requiring valid UTF-8.
+fn path_from_file_uri(uri: &[u8]) -> Option<PathBuf> {
+	use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+	let rest = uri.strip_prefix(b"file://")?;
+	let path = match rest.strip_prefix(b"localhost") {
+		Some(path) if path.starts_with(b"/") => path,
+		_ if rest.starts_with(b"/") => rest,
+		_ => return None,
+	};
+
+	let decoded: Vec<u8> = percent_decode(path).collect();
+	Some(PathBuf::from(OsString::from_vec(decoded)))
 }
 
 fn paths_to_uri_list(file_list: &[impl AsRef<Path>]) -> Result<String, Error> {
@@ -99,6 +115,19 @@ fn gnome_copied_files_from_uri_list(uri_list: &str) -> Vec<u8> {
 	// GNOME's copied-files format uses an action header followed by LF-separated URIs:
 	// https://github.com/linuxmint/nemo/blob/29fbc4b00005234dd92624a5620cc644525ba27c/libnemo-private/nemo-clipboard-monitor.c#L218-L260
 	format!("copy\n{}", uri_list.replace("\r\n", "\n")).into_bytes()
+}
+
+/// Converts UTF-8 text to ISO Latin-1, as required for the `STRING` target. Returns `None` if
+/// the text contains characters which aren't representable in Latin-1.
+///
+/// See: https://tronche.com/gui/x/icccm/sec-2.html#s-2.6.2
+fn utf8_to_latin1(text: &[u8]) -> Option<Vec<u8>> {
+	std::str::from_utf8(text).ok()?.chars().map(|c| u8::try_from(u32::from(c)).ok()).collect()
+}
+
+/// Converts ISO Latin-1 text, as used by the `STRING` target, to UTF-8.
+fn latin1_to_utf8(text: &[u8]) -> String {
+	text.iter().map(|&c| char::from(c)).collect()
 }
 
 /// Clipboard selection
@@ -492,6 +521,25 @@ mod tests {
 	}
 
 	#[test]
+	fn test_decoding_uri_list_hosts_and_comments() {
+		let uri_list = b"# a comment\r\nfile://localhost/tmp/local.txt\r\nfile://otherhost/tmp/remote.txt\r\nhttps://example.com/x\r\nfile:///tmp/plain.txt\r\n";
+		let paths = vec![PathBuf::from("/tmp/local.txt"), PathBuf::from("/tmp/plain.txt")];
+
+		assert_eq!(paths_from_uri_list(uri_list.to_vec()), paths);
+	}
+
+	#[test]
+	fn test_uri_list_non_utf8_round_trip() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+		// Paths on Unix aren't required to be valid UTF-8, which must not cause them to be dropped.
+		let uri_list = b"file:///tmp/latin1-%E9.txt".to_vec();
+		let expected = PathBuf::from(OsStr::from_bytes(b"/tmp/latin1-\xe9.txt"));
+
+		assert_eq!(paths_from_uri_list(uri_list), vec![expected]);
+	}
+
+	#[test]
 	fn test_decoding_gnome_copied_files() {
 		let file_list = b"copy\nfile:///tmp/bar.log\nfile:///tmp/white%20space.txt";
 		let paths = vec![PathBuf::from("/tmp/bar.log"), PathBuf::from("/tmp/white space.txt")];
@@ -515,5 +563,21 @@ mod tests {
 			gnome_copied_files_from_uri_list(uri_list),
 			b"copy\nfile:///tmp/bar.log\nfile:///tmp/white%20space.txt"
 		);
+	}
+
+	#[test]
+	fn latin1_conversion() {
+		assert_eq!(utf8_to_latin1("plain ascii".as_bytes()).unwrap(), b"plain ascii");
+		assert_eq!(utf8_to_latin1("café ±".as_bytes()).unwrap(), b"caf\xe9 \xb1");
+		// Characters outside of Latin-1 can't be served as `STRING`.
+		assert_eq!(utf8_to_latin1("emoji 🤓".as_bytes()), None);
+		assert_eq!(utf8_to_latin1("€".as_bytes()), None);
+		// Invalid UTF-8 can't be converted at all.
+		assert_eq!(utf8_to_latin1(b"\xff"), None);
+
+		assert_eq!(latin1_to_utf8(b"caf\xe9 \xb1"), "café ±");
+		for text in ["", "abc", "ÿ þ ß"] {
+			assert_eq!(latin1_to_utf8(&utf8_to_latin1(text.as_bytes()).unwrap()), text);
+		}
 	}
 }
