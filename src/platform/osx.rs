@@ -341,6 +341,10 @@ impl<'clipboard> Set<'clipboard> {
 
 	#[cfg(feature = "image-data")]
 	pub(crate) fn image(self, data: ImageData) -> Result<(), Error> {
+		// `CGImageCreate` trusts the dimensions to describe the buffer, so a mismatched
+		// buffer would cause CoreGraphics to read out of bounds.
+		data.validate()?;
+
 		let pixels = data.bytes.into();
 		let image = image_from_pixels(pixels, data.width, data.height)?;
 
@@ -361,8 +365,8 @@ impl<'clipboard> Set<'clipboard> {
 	}
 
 	pub(crate) fn file_list(self, file_list: &[impl AsRef<Path>]) -> Result<(), Error> {
-		self.clipboard.clear();
-
+		// Build the URLs before touching the pasteboard so that an invalid file list doesn't
+		// wipe out the user's current clipboard contents.
 		let uri_list = file_list
 			.iter()
 			.filter_map(|path| {
@@ -378,6 +382,8 @@ impl<'clipboard> Set<'clipboard> {
 		if uri_list.is_empty() {
 			return Err(Error::ConversionFailure);
 		}
+
+		self.clipboard.clear();
 
 		let objects = NSArray::from_retained_slice(&uri_list);
 		let success = unsafe { self.clipboard.pasteboard.writeObjects(&objects) };
@@ -434,5 +440,78 @@ impl SetExtApple for crate::Set<'_> {
 	fn exclude_from_history(mut self) -> Self {
 		self.platform.exclude_from_history = true;
 		self
+	}
+}
+
+/// These tests run against a private, uniquely named pasteboard instead of the general one so
+/// they can make assertions about failure paths without touching the user's clipboard.
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A clipboard backed by a fresh, uniquely-named pasteboard which is released when dropped.
+	struct UniqueClipboard(Clipboard);
+
+	impl UniqueClipboard {
+		fn new() -> Self {
+			let pasteboard = unsafe { NSPasteboard::pasteboardWithUniqueName() };
+			Self(Clipboard { pasteboard })
+		}
+
+		fn change_count(&self) -> isize {
+			unsafe { self.0.pasteboard.changeCount() }
+		}
+
+		fn text(&mut self) -> Result<String, Error> {
+			Get::new(&mut self.0).text()
+		}
+	}
+
+	impl Drop for UniqueClipboard {
+		fn drop(&mut self) {
+			// SAFETY: `-[NSPasteboard releaseGlobally]` takes no arguments and returns nothing.
+			let _: () = unsafe { msg_send![&*self.0.pasteboard, releaseGlobally] };
+		}
+	}
+
+	#[test]
+	fn invalid_file_list_preserves_contents() {
+		let mut clipboard = UniqueClipboard::new();
+		Set::new(&mut clipboard.0).text("keep me".into()).unwrap();
+		let before = clipboard.change_count();
+
+		let missing = [Path::new("/this/path/does/not/exist/arboard")];
+		assert!(matches!(
+			Set::new(&mut clipboard.0).file_list(&missing),
+			Err(Error::ConversionFailure)
+		));
+
+		assert_eq!(clipboard.change_count(), before, "the pasteboard must not be cleared");
+		assert_eq!(clipboard.text().unwrap(), "keep me");
+	}
+
+	#[cfg(feature = "image-data")]
+	#[test]
+	fn invalid_image_preserves_contents() {
+		let mut clipboard = UniqueClipboard::new();
+		Set::new(&mut clipboard.0).text("keep me".into()).unwrap();
+		let before = clipboard.change_count();
+
+		// Claims to be 4x4 but only carries a single pixel.
+		let image = ImageData { width: 4, height: 4, bytes: [0u8; 4].as_ref().into() };
+		assert!(matches!(Set::new(&mut clipboard.0).image(image), Err(Error::ConversionFailure)));
+
+		assert_eq!(clipboard.change_count(), before, "the pasteboard must not be cleared");
+		assert_eq!(clipboard.text().unwrap(), "keep me");
+	}
+
+	#[test]
+	fn file_list_round_trip() {
+		let mut clipboard = UniqueClipboard::new();
+		let this_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+		let paths = [this_dir.join("README.md"), this_dir.join("Cargo.toml")];
+
+		Set::new(&mut clipboard.0).file_list(&paths).unwrap();
+		assert_eq!(Get::new(&mut clipboard.0).file_list().unwrap(), paths);
 	}
 }
